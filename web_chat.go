@@ -36,10 +36,9 @@ func StartWebChat() {
 
 	// 建立一个多模型专属的 Agent 缓存池，以及初始化需要的基础资源
 	agentCache := make(map[string]*react.Agent)
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		fmt.Println("❌ OPENAI_API_KEY 未设置，无法启动 Web 对话")
-		return
+	defaultApiKey := os.Getenv("OPENAI_API_KEY")
+	if defaultApiKey == "" {
+		fmt.Println("⚠️ 警告: OPENAI_API_KEY 未设置，默认智谱模型可能无法启动")
 	}
 	tools := []tool.BaseTool{&CalculatorTool{}, &TimeTool{}}
 
@@ -85,9 +84,26 @@ func StartWebChat() {
 			return agent, nil
 		}
 
+		apiKey := defaultApiKey
+		baseURL := "https://open.bigmodel.cn/api/paas/v4"
+		
+		// 如果是通义千问模型，使用阿里百炼的配置
+		if strings.HasPrefix(modelName, "qwen") {
+			apiKey = os.Getenv("ALIYUN_API_KEY")
+			if apiKey == "" {
+				// 预置默认用户的千问 API Key 方便测试
+				apiKey = "sk-fff3074441cd4f6796b5324b41b37b21"
+			}
+			baseURL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+		}
+
+		if apiKey == "" {
+			return nil, fmt.Errorf("模型 %s 的 API Key 未配置", modelName)
+		}
+
 		chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
 			APIKey:  apiKey,
-			BaseURL: "https://open.bigmodel.cn/api/paas/v4",
+			BaseURL: baseURL,
 			Model:   modelName,
 		})
 		if err != nil {
@@ -574,9 +590,16 @@ const chatHTML = `<!DOCTYPE html>
   </div>
   <div class="model-selector">
     <select id="modelSelect" class="model-select">
-      <option value="glm-4.7-flash" title="当前主推的免费主力模型">GLM-4.7-Flash (免费主力)</option>
-      <option value="glm-4.1v-thinking-flash" selected title="带思考过程的模型">GLM-4.1V-Thinking-Flash (思考模式)</option>
-      <option value="glm-4-flash" title="最基础的响应速度最快">GLM-4-Flash (极速基础)</option>
+      <optgroup label="智谱 AI (GLM)">
+        <option value="glm-4.7-flash" title="当前主推的免费主力模型">GLM-4.7-Flash (免费主力)</option>
+        <option value="glm-4.1v-thinking-flash" selected title="带思考过程的模型">GLM-4.1V-Thinking-Flash (思考模式)</option>
+        <option value="glm-4-flash" title="最基础的响应速度最快">GLM-4-Flash (极速基础)</option>
+      </optgroup>
+      <optgroup label="阿里百炼 (通义千问)">
+        <option value="qwen-turbo" title="通义千问核心免费模型">Qwen-Turbo (免费全能)</option>
+        <option value="qwen-plus" title="通义千问进阶模型">Qwen-Plus (性能版)</option>
+        <option value="qwen-max" title="通义千问最强模型">Qwen-Max (旗舰主力)</option>
+      </optgroup>
     </select>
   </div>
   <div class="status">
