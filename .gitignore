@@ -1,0 +1,14 @@
+# IDE config
+.idea/
+.vscode/
+
+# Build outputs
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test output
+*.test
+*.out
