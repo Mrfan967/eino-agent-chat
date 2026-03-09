@@ -20,6 +20,7 @@ import (
 // chatRequest 请求结构
 type chatRequest struct {
 	Message string `json:"message"`
+	Model   string `json:"model"`
 }
 
 // chatResponse 响应结构
@@ -33,28 +34,14 @@ type chatResponse struct {
 func StartWebChat() {
 	ctx := context.Background()
 
+	// 建立一个多模型专属的 Agent 缓存池，以及初始化需要的基础资源
+	agentCache := make(map[string]*react.Agent)
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
 		fmt.Println("❌ OPENAI_API_KEY 未设置，无法启动 Web 对话")
 		return
 	}
-
-	// 创建 ChatModel
-	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
-		APIKey:  apiKey,
-		BaseURL: "https://open.bigmodel.cn/api/paas/v4",
-		Model:   "glm-4.1v-thinking-flash",
-	})
-	if err != nil {
-		fmt.Printf("创建 ChatModel 失败: %v\n", err)
-		return
-	}
-
-	// 创建 Agent
-	tools := []tool.BaseTool{
-		&CalculatorTool{},
-		&TimeTool{},
-	}
+	tools := []tool.BaseTool{&CalculatorTool{}, &TimeTool{}}
 
 	// 从配置文件读取 System Prompt
 	type rule struct {
@@ -88,21 +75,41 @@ func StartWebChat() {
 	}
 	fmt.Printf("✅ 已加载 System Prompt（%d 条规则）\n", len(cfg.Rules))
 
-	agent, err := react.NewAgent(ctx, &react.AgentConfig{
-		ToolCallingModel: chatModel,
-		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: tools,
-		},
-		MessageModifier: func(ctx context.Context, input []*schema.Message) []*schema.Message {
-			msgs := make([]*schema.Message, 0, len(input)+1)
-			msgs = append(msgs, schema.SystemMessage(systemPrompt))
-			msgs = append(msgs, input...)
-			return msgs
-		},
-	})
-	if err != nil {
-		fmt.Printf("创建 Agent 失败: %v\n", err)
-		return
+	// 提供一个获取对应模型 Agent 的工厂函数
+	getOrCreateAgent := func(ctx context.Context, modelName string) (*react.Agent, error) {
+		if modelName == "" {
+			modelName = "glm-4.1v-thinking-flash" // 默认模型
+		}
+		
+		if agent, ok := agentCache[modelName]; ok {
+			return agent, nil
+		}
+
+		chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+			APIKey:  apiKey,
+			BaseURL: "https://open.bigmodel.cn/api/paas/v4",
+			Model:   modelName,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("创建 ChatModel 失败: %v", err)
+		}
+
+		agent, err := react.NewAgent(ctx, &react.AgentConfig{
+			ToolCallingModel: chatModel,
+			ToolsConfig: compose.ToolsNodeConfig{Tools: tools},
+			MessageModifier: func(ctx context.Context, input []*schema.Message) []*schema.Message {
+				msgs := make([]*schema.Message, 0, len(input)+1)
+				msgs = append(msgs, schema.SystemMessage(systemPrompt))
+				msgs = append(msgs, input...)
+				return msgs
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("创建 Agent 失败: %v", err)
+		}
+		
+		agentCache[modelName] = agent
+		return agent, nil
 	}
 
 	// 聊天 API
@@ -125,6 +132,12 @@ func StartWebChat() {
 
 		messages := []*schema.Message{
 			schema.UserMessage(req.Message),
+		}
+
+		agent, err := getOrCreateAgent(ctx, req.Model)
+		if err != nil {
+			json.NewEncoder(w).Encode(chatResponse{Error: err.Error()})
+			return
 		}
 
 		result, err := agent.Generate(ctx, messages)
@@ -238,19 +251,47 @@ const chatHTML = `<!DOCTYPE html>
   }
 
   .header h1 {
+    margin: 0;
     font-size: 18px;
     font-weight: 600;
-    background: linear-gradient(135deg, #c4b5fd, #8b5cf6);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    color: #f4f4f5;
   }
-
   .header .subtitle {
     font-size: 12px;
-    color: #71717a;
+    color: #a1a1aa;
+    margin-top: 2px;
   }
-
-  .header .status {
+  .model-selector {
+    margin-right: 15px;
+  }
+  .model-select {
+    padding: 6px 30px 6px 12px;
+    font-size: 13px;
+    color: #e4e4e7;
+    background-color: #27272a;
+    border: 1px solid #3f3f46;
+    border-radius: 6px;
+    appearance: none;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml;charset=US-ASCII,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%22292.4%22%20height%3D%22292.4%22%3E%3Cpath%20fill%3D%22%23a1a1aa%22%20d%3D%22M287%2069.4a17.6%2017.6%200%200%200-13-5.4H18.4c-5%200-9.3%201.8-12.9%205.4A17.6%2017.6%200%200%200%200%2082.2c0%205%201.8%209.3%205.4%2012.9l128%20127.9c3.6%203.6%207.8%205.4%2012.8%205.4s9.2-1.8%2012.8-5.4L287%2095c3.5-3.5%205.4-7.8%205.4-12.8%200-5-1.9-9.2-5.5-12.8z%22%2F%3E%3C%2Fsvg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px top 50%;
+    background-size: 10px auto;
+    transition: all 0.2s;
+  }
+  .model-select:hover {
+    border-color: #52525b;
+  }
+  .model-select:focus {
+    outline: none;
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+  }
+  .model-select option {
+    background-color: #18181b;
+    color: #e4e4e7;
+  }
+  .status {
     margin-left: auto;
     display: flex;
     align-items: center;
@@ -529,7 +570,14 @@ const chatHTML = `<!DOCTYPE html>
   <div class="logo">🤖</div>
   <div>
     <h1>Eino Agent</h1>
-    <div class="subtitle">Powered by GLM-4-Flash</div>
+    <div class="subtitle">全能智能助手</div>
+  </div>
+  <div class="model-selector">
+    <select id="modelSelect" class="model-select">
+      <option value="glm-4.7-flash" title="当前主推的免费主力模型">GLM-4.7-Flash (免费主力)</option>
+      <option value="glm-4.1v-thinking-flash" selected title="带思考过程的模型">GLM-4.1V-Thinking-Flash (思考模式)</option>
+      <option value="glm-4-flash" title="最基础的响应速度最快">GLM-4-Flash (极速基础)</option>
+    </select>
   </div>
   <div class="status">
     <div class="status-dot"></div>
@@ -649,10 +697,11 @@ async function sendMessage() {
   showTyping();
 
   try {
+    const selectedModel = document.getElementById('modelSelect').value;
     const resp = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text })
+      body: JSON.stringify({ message: text, model: selectedModel })
     });
     const data = await resp.json();
     removeTyping();
