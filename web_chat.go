@@ -9,17 +9,19 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 
+	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/flow/agent/react"
 	"github.com/cloudwego/eino/schema"
-	"github.com/cloudwego/eino-ext/components/model/openai"
 )
 
 // chatRequest 请求结构
 type chatRequest struct {
 	Message string `json:"message"`
+	Model   string `json:"model"`
 }
 
 // chatResponse 响应结构
@@ -29,84 +31,56 @@ type chatResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
+// streamChunk 流式输出的单个数据块
+type streamChunk struct {
+	Content string `json:"content,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Done    bool   `json:"done,omitempty"`
+	Image   string `json:"image,omitempty"`
+}
+
+// promptConfig 提示词配置
+type promptConfig struct {
+	Persona  string `json:"persona"`
+	Rules    []rule `json:"rules"`
+	Fallback string `json:"fallback"`
+}
+
+type rule struct {
+	Trigger string `json:"trigger"`
+	Answer  string `json:"answer"`
+	Image   string `json:"image"`
+}
+
+// Global state
+var (
+	agents              = make(map[string]*react.Agent)
+	conversationHistory = make([]*schema.Message, 0)
+	historyMutex        sync.Mutex
+)
+
 // StartWebChat 启动 Web 聊天服务
 func StartWebChat() {
 	ctx := context.Background()
 
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		fmt.Println("❌ OPENAI_API_KEY 未设置，无法启动 Web 对话")
-		return
-	}
-
-	// 创建 ChatModel
-	chatModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
-		APIKey:  apiKey,
-		BaseURL: "https://open.bigmodel.cn/api/paas/v4",
-		Model:   "glm-4.1v-thinking-flash",
-	})
+	// 1. 初始化模型和 Agent
+	err := initAgents(ctx)
 	if err != nil {
-		fmt.Printf("创建 ChatModel 失败: %v\n", err)
+		fmt.Printf("初始化 Agents 失败: %v\n", err)
 		return
 	}
 
-	// 创建 Agent
-	tools := []tool.BaseTool{
-		&CalculatorTool{},
-		&TimeTool{},
-	}
-
-	// 从配置文件读取 System Prompt
-	type rule struct {
-		Trigger string `json:"trigger"`
-		Answer  string `json:"answer"`
-		Image   string `json:"image"`
-	}
-	type promptConfig struct {
-		Persona  string `json:"persona"`
-		Rules    []rule `json:"rules"`
-		Fallback string `json:"fallback"`
-	}
-	promptData, err := os.ReadFile("prompt_config.json")
+	promptData, err := readPromptConfig()
 	if err != nil {
 		fmt.Printf("⚠️  读取 prompt_config.json 失败: %v，将使用默认提示\n", err)
-		promptData = []byte(`{"persona":"你是一个智能助手，请友好地回答用户的问题。","rules":[],"fallback":""}`)
+		promptData = &promptConfig{
+			Persona: "你是人工智能助手，擅长中文和英文的对话。",
+		}
 	}
-	var cfg promptConfig
-	if err := json.Unmarshal(promptData, &cfg); err != nil {
-		fmt.Printf("⚠️  解析 prompt_config.json 失败: %v\n", err)
-		return
-	}
+	cfg := promptData
 
-	// 拼接 System Prompt
-	systemPrompt := cfg.Persona + "\n在回答问题时，请遵循以下规则：\n\n"
-	for i, r := range cfg.Rules {
-		systemPrompt += fmt.Sprintf("%d. 当用户问\"%s\"或类似问题时，回答：%s\n\n", i+1, r.Trigger, r.Answer)
-	}
-	if cfg.Fallback != "" {
-		systemPrompt += cfg.Fallback
-	}
-	fmt.Printf("✅ 已加载 System Prompt（%d 条规则）\n", len(cfg.Rules))
-
-	agent, err := react.NewAgent(ctx, &react.AgentConfig{
-		ToolCallingModel: chatModel,
-		ToolsConfig: compose.ToolsNodeConfig{
-			Tools: tools,
-		},
-		MessageModifier: func(ctx context.Context, input []*schema.Message) []*schema.Message {
-			msgs := make([]*schema.Message, 0, len(input)+1)
-			msgs = append(msgs, schema.SystemMessage(systemPrompt))
-			msgs = append(msgs, input...)
-			return msgs
-		},
-	})
-	if err != nil {
-		fmt.Printf("创建 Agent 失败: %v\n", err)
-		return
-	}
-
-	// 聊天 API
-	http.HandleFunc("/api/chat", func(w http.ResponseWriter, r *http.Request) {
+	// ======================== SSE 流式聊天 API ========================
+	http.HandleFunc("/api/chat/stream", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
@@ -114,53 +88,126 @@ func StartWebChat() {
 
 		var req chatRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			json.NewEncoder(w).Encode(chatResponse{Error: "请求格式错误"})
+			http.Error(w, "请求格式错误", http.StatusBadRequest)
 			return
 		}
-
 		if req.Message == "" {
-			json.NewEncoder(w).Encode(chatResponse{Error: "消息不能为空"})
+			http.Error(w, "消息不能为空", http.StatusBadRequest)
 			return
 		}
 
-		messages := []*schema.Message{
-			schema.UserMessage(req.Message),
+		modelID := req.Model
+		if modelID == "" {
+			modelID = "kimi-k2" // 默认模型
 		}
 
-		result, err := agent.Generate(ctx, messages)
+		agent, ok := agents[modelID]
+		if !ok {
+			http.Error(w, "不支持的模型", http.StatusBadRequest)
+			return
+		}
 
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		// 设置 SSE 响应头
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "不支持流式输出", http.StatusInternalServerError)
+			return
+		}
+
+		// 追加用户消息到历史
+		userMsg := schema.UserMessage(req.Message)
+
+		historyMutex.Lock()
+		conversationHistory = append(conversationHistory, userMsg)
+		// 拷贝历史用于当前请求
+		messages := make([]*schema.Message, len(conversationHistory))
+		copy(messages, conversationHistory)
+		historyMutex.Unlock()
+
+		// 使用 Agent 的 Stream 方法。注意 React Agent 的 Stream / Generate 接收的是 []*schema.Message
+		streamResult, err := agent.Stream(r.Context(), messages)
 		if err != nil {
-			json.NewEncoder(w).Encode(chatResponse{Error: fmt.Sprintf("Agent 出错: %v", err)})
+			chunk, _ := json.Marshal(streamChunk{Error: fmt.Sprintf("Agent 出错: %v", err)})
+			fmt.Fprintf(w, "data: %s\n\n", chunk)
+			flusher.Flush()
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+
+			// 失败时从历史中移除刚刚添加的用户消息
+			historyMutex.Lock()
+			if len(conversationHistory) > 0 {
+				conversationHistory = conversationHistory[:len(conversationHistory)-1]
+			}
+			historyMutex.Unlock()
 			return
 		}
 
-		// 匹配图片：1. 输入精确匹配 Trigger
-		var imageURL string
-		msgLower := strings.ToLower(req.Message)
-		for _, r := range cfg.Rules {
-			triggerLower := strings.ToLower(r.Trigger)
-			if r.Image != "" && (strings.Contains(msgLower, triggerLower) || strings.Contains(triggerLower, msgLower)) {
-				imageURL = "/image/" + r.Image
+		var fullContent strings.Builder
+
+		// 逐 chunk 读取并推送
+		for {
+			msg, err := streamResult.Recv()
+			if err != nil {
+				// 流结束
 				break
 			}
-		}
-
-		// 2. 智能兜底判定：如果规则没命中，但 AI 回答里提到了具体的人（由 Fallback 机制生成的回答）
-		if imageURL == "" {
-			replyLower := strings.ToLower(result.Content)
-			if strings.Contains(replyLower, "赵苏通") {
-				imageURL = "/image/su.jpg"
-			} else if strings.Contains(replyLower, "范晨旭") {
-				imageURL = "/image/fan.jpg"
+			if msg == nil {
+				continue
 			}
+
+			content := msg.Content
+			if content == "" {
+				continue
+			}
+
+			fullContent.WriteString(content)
+
+			chunk, _ := json.Marshal(streamChunk{Content: content})
+			fmt.Fprintf(w, "data: %s\n\n", chunk)
+			flusher.Flush()
 		}
 
-		json.NewEncoder(w).Encode(chatResponse{Reply: result.Content, Image: imageURL})
+		finalReply := fullContent.String()
+
+		// 追加 AI 回复到历史
+		if finalReply != "" {
+			historyMutex.Lock()
+			conversationHistory = append(conversationHistory, schema.AssistantMessage(finalReply, nil))
+			historyMutex.Unlock()
+		}
+
+		// 匹配图片
+		imageURL := matchImage(cfg, req.Message, finalReply)
+		if imageURL != "" {
+			chunk, _ := json.Marshal(streamChunk{Image: imageURL})
+			fmt.Fprintf(w, "data: %s\n\n", chunk)
+			flusher.Flush()
+		}
+
+		// 发送结束标识
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	})
+
+	// ======================== 清空历史 API ========================
+	http.HandleFunc("/api/chat/clear", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		historyMutex.Lock()
+		conversationHistory = make([]*schema.Message, 0)
+		historyMutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok"}`))
 	})
 
 	// 图片静态文件服务
-	os.MkdirAll("image", 0755)
 	http.Handle("/image/", http.StripPrefix("/image/", http.FileServer(http.Dir("image"))))
 
 	// 页面
@@ -170,16 +217,140 @@ func StartWebChat() {
 	})
 
 	addr := ":8080"
-	fmt.Println("\n🌐 Web 对话服务已启动！")
+	fmt.Println("\n🌐 Web 对话服务已启动！(支持多模型 + 上下文记忆)")
 	fmt.Println("   浏览器访问: http://localhost" + addr)
 	fmt.Println("   按 Ctrl+C 停止服务\n")
 
-	// 自动打开浏览器
 	openBrowser("http://localhost" + addr)
 
 	if err := http.ListenAndServe(addr, nil); err != nil {
 		fmt.Printf("服务启动失败: %v\n", err)
 	}
+}
+
+func initAgents(ctx context.Context) error {
+	tools := []tool.BaseTool{
+		&CalculatorTool{},
+		&TimeTool{},
+		&KnowledgeTool{}, // 新增 RAG 工具
+	}
+
+	// 0. 初始化 RAG (优先使用智谱 Key，如果没有则回退 OpenAI Key)
+	glmKey := os.Getenv("ZHIPU_API_KEY")
+	if glmKey == "" {
+		glmKey = os.Getenv("OPENAI_API_KEY")
+	}
+	if err := InitRAG(ctx, glmKey); err != nil {
+		fmt.Printf("⚠️  RAG 知识库初始化失败: %v\n", err)
+	} else {
+		fmt.Printf("✅ RAG 知识库初始化成功 (如果 knowledge 目录下有文件)\n")
+	}
+
+	promptData, _ := readPromptConfig()
+	systemPrompt := ""
+	if promptData != nil {
+		systemPrompt = promptData.Persona + "\n在回答问题时，请遵循以下规则：\n\n"
+		for i, r := range promptData.Rules {
+			systemPrompt += fmt.Sprintf("%d. 当用户问\"%s\"或类似问题时，回答：%s\n\n", i+1, r.Trigger, r.Answer)
+		}
+		if promptData.Fallback != "" {
+			systemPrompt += promptData.Fallback
+		}
+	} else {
+		systemPrompt = "你是智能助手"
+	}
+
+	// 追加知识检索的通用提示
+	systemPrompt += "\n[系统提示: 当用户的问题涉及内部规定、人物事迹、技术细节等，请优先使用 knowledge_retriever 工具搜索最新资料。不要完全凭猜测回答。]\n"
+
+	messageModifier := func(ctx context.Context, input []*schema.Message) []*schema.Message {
+		msgs := make([]*schema.Message, 0, len(input)+1)
+		msgs = append(msgs, schema.SystemMessage(systemPrompt))
+		msgs = append(msgs, input...)
+		return msgs
+	}
+
+	// 1. Kimi K2
+	kimiKey := os.Getenv("MOONSHOT_API_KEY")
+	if kimiKey == "" {
+		kimiKey = "sk-5rKOvSmwV015EurXmJaSLSdsnk8tOEFdQkCJkLpfJrBiELIb" // 默认演示 Key
+	}
+	kimiModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+		APIKey:  kimiKey,
+		BaseURL: "https://api.moonshot.cn/v1",
+		Model:   "moonshot-v1-8k",
+	})
+	if err != nil {
+		return fmt.Errorf("kimi model init failed: %v", err)
+	}
+	kimiAgent, err := react.NewAgent(ctx, &react.AgentConfig{
+		ToolCallingModel: kimiModel,
+		ToolsConfig:      compose.ToolsNodeConfig{Tools: tools},
+		MessageModifier:  messageModifier,
+	})
+	if err != nil {
+		return fmt.Errorf("kimi agent init failed: %v", err)
+	}
+	agents["kimi-k2"] = kimiAgent
+
+	// 2. 智谱 GLM-4  (无条件注册，如果Key为空将在调用时报错而不是提示不支持该模型)
+	glmKey = os.Getenv("ZHIPU_API_KEY")
+	if glmKey == "" {
+		glmKey = os.Getenv("OPENAI_API_KEY") // 兼容旧的环境变量
+	}
+	if glmKey == "" {
+		fmt.Println("⚠️  未设置 ZHIPU_API_KEY 或 OPENAI_API_KEY 环境变量，智谱 GLM 模型将无法调用")
+	}
+	glmModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
+		APIKey:  glmKey,
+		BaseURL: "https://open.bigmodel.cn/api/paas/v4",
+		Model:   "glm-4.1v-thinking-flash",
+	})
+	if err == nil {
+		glmAgent, err := react.NewAgent(ctx, &react.AgentConfig{
+			ToolCallingModel: glmModel,
+			ToolsConfig:      compose.ToolsNodeConfig{Tools: tools},
+			MessageModifier:  messageModifier,
+		})
+		if err == nil {
+			agents["glm-4"] = glmAgent
+		}
+	}
+
+	return nil
+}
+
+// readPromptConfig 读取提示词配置
+func readPromptConfig() (*promptConfig, error) {
+	data, err := os.ReadFile("prompt_config.json")
+	if err != nil {
+		return nil, err
+	}
+	var cfg promptConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+// matchImage 匹配图片
+func matchImage(cfg *promptConfig, userMsg, reply string) string {
+	msgLower := strings.ToLower(userMsg)
+	for _, r := range cfg.Rules {
+		triggerLower := strings.ToLower(r.Trigger)
+		if r.Image != "" && (strings.Contains(msgLower, triggerLower) || strings.Contains(triggerLower, msgLower)) {
+			return "/image/" + r.Image
+		}
+	}
+
+	// 智能兜底
+	replyLower := strings.ToLower(reply)
+	if strings.Contains(replyLower, "赵苏通") {
+		return "/image/su.jpg"
+	} else if strings.Contains(replyLower, "范晨旭") {
+		return "/image/fan.jpg"
+	}
+	return ""
 }
 
 func openBrowser(url string) {
@@ -201,7 +372,7 @@ const chatHTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Eino Agent 对话</title>
+<title>Agent 智能对话平台</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -215,7 +386,6 @@ const chatHTML = `<!DOCTYPE html>
     flex-direction: column;
   }
 
-  /* 顶栏 */
   .header {
     background: linear-gradient(135deg, #1a1a2e 0%, #16162a 100%);
     border-bottom: 1px solid rgba(139, 92, 246, 0.2);
@@ -245,33 +415,38 @@ const chatHTML = `<!DOCTYPE html>
     -webkit-text-fill-color: transparent;
   }
 
-  .header .subtitle {
-    font-size: 12px;
-    color: #71717a;
-  }
-
-  .header .status {
+  .header .controls {
     margin-left: auto;
     display: flex;
     align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: #a1a1aa;
+    gap: 12px;
   }
 
-  .header .status-dot {
-    width: 8px; height: 8px;
-    background: #22c55e;
-    border-radius: 50%;
-    animation: pulse 2s ease-in-out infinite;
+  select {
+    background: #1e1e2e;
+    color: #e4e4e7;
+    border: 1px solid rgba(139, 92, 246, 0.4);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 13px;
+    outline: none;
+    cursor: pointer;
+  }
+  
+  .clear-btn {
+    background: rgba(239, 68, 68, 0.1);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .clear-btn:hover {
+    background: rgba(239, 68, 68, 0.2);
   }
 
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-  }
-
-  /* 功能标签 */
   .capabilities {
     display: flex;
     justify-content: center;
@@ -291,7 +466,6 @@ const chatHTML = `<!DOCTYPE html>
     border: 1px solid rgba(139, 92, 246, 0.2);
   }
 
-  /* 消息区 */
   .messages {
     flex: 1;
     overflow-y: auto;
@@ -382,7 +556,19 @@ const chatHTML = `<!DOCTYPE html>
     transform: scale(1.03);
   }
 
-  /* 加载动画 */
+  /* 流式输出光标动画 */
+  .streaming-cursor::after {
+    content: '▊';
+    animation: blink 0.8s infinite;
+    color: #8b5cf6;
+    margin-left: 1px;
+  }
+
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+
   .typing {
     display: flex;
     gap: 4px;
@@ -404,7 +590,6 @@ const chatHTML = `<!DOCTYPE html>
     40% { transform: scale(1); opacity: 1; }
   }
 
-  /* 欢迎消息 */
   .welcome {
     text-align: center;
     padding: 48px 24px;
@@ -452,7 +637,6 @@ const chatHTML = `<!DOCTYPE html>
     transform: translateY(-1px);
   }
 
-  /* 输入区 */
   .input-area {
     padding: 16px 24px 24px;
     background: linear-gradient(180deg, transparent, rgba(15, 15, 20, 0.8));
@@ -528,12 +712,15 @@ const chatHTML = `<!DOCTYPE html>
 <div class="header">
   <div class="logo">🤖</div>
   <div>
-    <h1>Eino Agent</h1>
-    <div class="subtitle">Powered by GLM-4-Flash</div>
+    <h1>Agent 智能对话平台</h1>
+    <div class="subtitle">流式输出 · 上下文记忆</div>
   </div>
-  <div class="status">
-    <div class="status-dot"></div>
-    在线
+  <div class="controls">
+    <select id="modelSelect">
+      <option value="kimi-k2">Kimi K2</option>
+      <option value="glm-4">智谱 GLM-4</option>
+    </select>
+    <button class="clear-btn" onclick="clearHistory()">清空记忆</button>
   </div>
 </div>
 
@@ -541,18 +728,19 @@ const chatHTML = `<!DOCTYPE html>
   <span class="cap-tag">💬 智能对话</span>
   <span class="cap-tag">🧮 数学计算</span>
   <span class="cap-tag">🕐 时间查询</span>
+  <span class="cap-tag">⚡ 流式输出</span>
 </div>
 
 <div class="messages" id="messages">
   <div class="welcome" id="welcome">
     <div class="icon">✨</div>
     <h2>你好，有什么可以帮你的？</h2>
-    <p>我是 Eino Agent，可以和你聊天、帮你计算、查询时间</p>
+    <p>我是全能 AI 助手，带有记忆功能。你可以随时切换模型，或者清空对话记忆。</p>
     <div class="suggestions">
       <div class="suggestion" onclick="sendSuggestion(this)">现在几点了？</div>
       <div class="suggestion" onclick="sendSuggestion(this)">帮我算 1024 × 768</div>
-      <div class="suggestion" onclick="sendSuggestion(this)">介绍一下 Go 语言</div>
-      <div class="suggestion" onclick="sendSuggestion(this)">什么是 Goroutine？</div>
+      <div class="suggestion" onclick="sendSuggestion(this)">介绍一下你的大语言模型</div>
+      <div class="suggestion" onclick="sendSuggestion(this)">刚才的问题你还记得吗？</div>
     </div>
   </div>
 </div>
@@ -570,6 +758,7 @@ const messagesEl = document.getElementById('messages');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('sendBtn');
 const welcomeEl = document.getElementById('welcome');
+const modelSelect = document.getElementById('modelSelect');
 let isLoading = false;
 
 inputEl.addEventListener('keydown', e => {
@@ -584,8 +773,24 @@ function sendSuggestion(el) {
   sendMessage();
 }
 
+async function clearHistory() {
+  if (!confirm("确定要清空服务端的所有对话记忆吗？")) return;
+  
+  try {
+    await fetch('/api/chat/clear', { method: 'POST' });
+    messagesEl.innerHTML = '';
+    const clone = welcomeEl.cloneNode(true);
+    messagesEl.appendChild(clone);
+    clone.id = "welcome"; // keep the ID so it can be removed again
+    addMessage("记忆已清空 👋", "agent");
+  } catch (e) {
+    alert("清空失败: " + e.message);
+  }
+}
+
 function addMessage(text, role, imageUrl) {
-  if (welcomeEl) welcomeEl.remove();
+  const currentWelcome = document.getElementById('welcome');
+  if (currentWelcome) currentWelcome.style.display = 'none';
 
   const div = document.createElement('div');
   div.className = 'msg ' + role;
@@ -610,7 +815,29 @@ function addMessage(text, role, imageUrl) {
   div.appendChild(bubble);
   messagesEl.appendChild(div);
   messagesEl.scrollTop = messagesEl.scrollHeight;
-  return div;
+  return bubble;
+}
+
+// 创建空的 agent 消息气泡（用于流式填充）
+function addStreamBubble() {
+  const currentWelcome = document.getElementById('welcome');
+  if (currentWelcome) currentWelcome.style.display = 'none';
+
+  const div = document.createElement('div');
+  div.className = 'msg agent';
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = '🤖';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble streaming-cursor';
+
+  div.appendChild(avatar);
+  div.appendChild(bubble);
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return bubble;
 }
 
 function showTyping() {
@@ -641,6 +868,8 @@ async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text || isLoading) return;
 
+  const selectedModel = modelSelect.value;
+
   isLoading = true;
   sendBtn.disabled = true;
   inputEl.value = '';
@@ -649,22 +878,85 @@ async function sendMessage() {
   showTyping();
 
   try {
-    const resp = await fetch('/api/chat', {
+    const resp = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text })
+      body: JSON.stringify({ message: text, model: selectedModel })
     });
-    const data = await resp.json();
-    removeTyping();
 
-    if (data.error) {
-      addMessage('❌ ' + data.error, 'error');
-    } else {
-      addMessage(data.reply, 'agent', data.image);
+    if (!resp.ok) {
+      removeTyping();
+      // fetch backend text for detail if bad request
+      let errDetail = resp.statusText;
+      try {
+          errDetail = await resp.text();
+      } catch (e) {}
+      addMessage('❌ 服务器错误: ' + resp.status + " - " + errDetail, 'error');
+      isLoading = false;
+      sendBtn.disabled = false;
+      inputEl.focus();
+      return;
     }
+
+    removeTyping();
+    const bubble = addStreamBubble();
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // 按行解析 SSE
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // 保留未完成的行
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data: ')) continue;
+
+        const data = trimmed.slice(6); // 去掉 "data: "
+        if (data === '[DONE]') {
+          bubble.classList.remove('streaming-cursor');
+          continue;
+        }
+
+        try {
+          const chunk = JSON.parse(data);
+
+          if (chunk.error) {
+            bubble.textContent = '❌ ' + chunk.error;
+            bubble.classList.remove('streaming-cursor');
+            continue;
+          }
+
+          if (chunk.content) {
+            bubble.textContent += chunk.content;
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+          }
+
+          if (chunk.image) {
+            const img = document.createElement('img');
+            img.src = chunk.image;
+            img.className = 'chat-img';
+            img.onclick = () => window.open(chunk.image, '_blank');
+            bubble.appendChild(img);
+          }
+        } catch (e) {
+          // 忽略解析错误
+        }
+      }
+    }
+
+    bubble.classList.remove('streaming-cursor');
+
   } catch (err) {
     removeTyping();
-    addMessage('❌ 网络错误，请重试', 'error');
+    addMessage('❌ 网络错误: ' + err.message, 'error');
   }
 
   isLoading = false;

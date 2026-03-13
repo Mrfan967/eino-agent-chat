@@ -12,3 +12,8 @@
 # Test output
 *.test
 *.out
+
+# Caches and temporary files
+.gocache/
+trim.txt
+awesomeProject_linux
