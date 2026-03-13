@@ -20,8 +20,9 @@ import (
 
 // chatRequest 请求结构
 type chatRequest struct {
-	Message string `json:"message"`
-	Model   string `json:"model"`
+	Message   string `json:"message"`
+	Model     string `json:"model"`
+	SessionID string `json:"session_id"`
 }
 
 // chatResponse 响应结构
@@ -41,9 +42,10 @@ type streamChunk struct {
 
 // promptConfig 提示词配置
 type promptConfig struct {
-	Persona  string `json:"persona"`
-	Rules    []rule `json:"rules"`
-	Fallback string `json:"fallback"`
+	Persona     string   `json:"persona"`
+	SystemRules []string `json:"system_rules"`
+	Rules       []rule   `json:"rules"`
+	Fallback    string   `json:"fallback"`
 }
 
 type rule struct {
@@ -54,9 +56,9 @@ type rule struct {
 
 // Global state
 var (
-	agents              = make(map[string]*react.Agent)
-	conversationHistory = make([]*schema.Message, 0)
-	historyMutex        sync.Mutex
+	agents           = make(map[string]*react.Agent)
+	sessionHistories = make(map[string][]*schema.Message)
+	historyMutex     sync.Mutex
 )
 
 // StartWebChat 启动 Web 聊天服务
@@ -121,12 +123,19 @@ func StartWebChat() {
 
 		// 追加用户消息到历史
 		userMsg := schema.UserMessage(req.Message)
+		sid := req.SessionID
+		if sid == "" {
+			sid = "default"
+		}
 
 		historyMutex.Lock()
-		conversationHistory = append(conversationHistory, userMsg)
+		history := sessionHistories[sid]
+		history = append(history, userMsg)
+		sessionHistories[sid] = history
+
 		// 拷贝历史用于当前请求
-		messages := make([]*schema.Message, len(conversationHistory))
-		copy(messages, conversationHistory)
+		messages := make([]*schema.Message, len(history))
+		copy(messages, history)
 		historyMutex.Unlock()
 
 		// 使用 Agent 的 Stream 方法。注意 React Agent 的 Stream / Generate 接收的是 []*schema.Message
@@ -140,8 +149,8 @@ func StartWebChat() {
 
 			// 失败时从历史中移除刚刚添加的用户消息
 			historyMutex.Lock()
-			if len(conversationHistory) > 0 {
-				conversationHistory = conversationHistory[:len(conversationHistory)-1]
+			if h, ok := sessionHistories[sid]; ok && len(h) > 0 {
+				sessionHistories[sid] = h[:len(h)-1]
 			}
 			historyMutex.Unlock()
 			return
@@ -177,7 +186,7 @@ func StartWebChat() {
 		// 追加 AI 回复到历史
 		if finalReply != "" {
 			historyMutex.Lock()
-			conversationHistory = append(conversationHistory, schema.AssistantMessage(finalReply, nil))
+			sessionHistories[sid] = append(sessionHistories[sid], schema.AssistantMessage(finalReply, nil))
 			historyMutex.Unlock()
 		}
 
@@ -200,8 +209,17 @@ func StartWebChat() {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
 		}
+
+		var req struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求格式错误", http.StatusBadRequest)
+			return
+		}
+
 		historyMutex.Lock()
-		conversationHistory = make([]*schema.Message, 0)
+		delete(sessionHistories, req.SessionID)
 		historyMutex.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
@@ -251,17 +269,23 @@ func initAgents(ctx context.Context) error {
 	if promptData != nil {
 		systemPrompt = promptData.Persona + "\n在回答问题时，请遵循以下规则：\n\n"
 		for i, r := range promptData.Rules {
-			systemPrompt += fmt.Sprintf("%d. 当用户问\"%s\"或类似问题时，回答：%s\n\n", i+1, r.Trigger, r.Answer)
+			systemPrompt += fmt.Sprintf("条目%d. 当用户问\"%s\"或类似问题时，回答：%s\n\n", i+1, r.Trigger, r.Answer)
 		}
+
+		if len(promptData.SystemRules) > 0 {
+			systemPrompt += "系统全局规则：\n"
+			for i, sr := range promptData.SystemRules {
+				systemPrompt += fmt.Sprintf("- 规则%d: %s\n", i+1, sr)
+			}
+			systemPrompt += "\n"
+		}
+
 		if promptData.Fallback != "" {
-			systemPrompt += promptData.Fallback
+			systemPrompt += "兜底策略：" + promptData.Fallback
 		}
 	} else {
 		systemPrompt = "你是智能助手"
 	}
-
-	// 追加知识检索的通用提示
-	systemPrompt += "\n[系统提示: 当用户的问题涉及内部规定、人物事迹、技术细节等，请优先使用 knowledge_retriever 工具搜索最新资料。不要完全凭猜测回答。]\n"
 
 	messageModifier := func(ctx context.Context, input []*schema.Message) []*schema.Message {
 		msgs := make([]*schema.Message, 0, len(input)+1)
@@ -761,6 +785,14 @@ const welcomeEl = document.getElementById('welcome');
 const modelSelect = document.getElementById('modelSelect');
 let isLoading = false;
 
+// Session ID 管理
+let sessionId = sessionStorage.getItem('sessionId');
+if (!sessionId) {
+  sessionId = 'sess_' + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+  sessionStorage.setItem('sessionId', sessionId);
+}
+console.log("Current Session ID:", sessionId);
+
 inputEl.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && !isLoading) {
     e.preventDefault();
@@ -774,10 +806,14 @@ function sendSuggestion(el) {
 }
 
 async function clearHistory() {
-  if (!confirm("确定要清空服务端的所有对话记忆吗？")) return;
+  if (!confirm("确定要清空当前的对话记忆吗？")) return;
   
   try {
-    await fetch('/api/chat/clear', { method: 'POST' });
+    await fetch('/api/chat/clear', { 
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId })
+    });
     messagesEl.innerHTML = '';
     const clone = welcomeEl.cloneNode(true);
     messagesEl.appendChild(clone);
@@ -881,7 +917,11 @@ async function sendMessage() {
     const resp = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, model: selectedModel })
+      body: JSON.stringify({ 
+        message: text, 
+        model: selectedModel,
+        session_id: sessionId
+      })
     });
 
     if (!resp.ok) {
