@@ -18,21 +18,12 @@ import (
 	"github.com/cloudwego/eino/schema"
 )
 
-// chatRequest 请求结构
 type chatRequest struct {
 	Message   string `json:"message"`
 	Model     string `json:"model"`
 	SessionID string `json:"session_id"`
 }
 
-// chatResponse 响应结构
-type chatResponse struct {
-	Reply string `json:"reply"`
-	Image string `json:"image,omitempty"`
-	Error string `json:"error,omitempty"`
-}
-
-// streamChunk 流式输出的单个数据块
 type streamChunk struct {
 	Content string `json:"content,omitempty"`
 	Error   string `json:"error,omitempty"`
@@ -40,7 +31,6 @@ type streamChunk struct {
 	Image   string `json:"image,omitempty"`
 }
 
-// promptConfig 提示词配置
 type promptConfig struct {
 	Persona     string   `json:"persona"`
 	SystemRules []string `json:"system_rules"`
@@ -54,23 +44,17 @@ type rule struct {
 	Image   string `json:"image"`
 }
 
-// Global state
 var (
-	agents           = make(map[string]*react.Agent)
+	agentCache       = make(map[string]*react.Agent)
+	agentMutex       sync.Mutex
 	sessionHistories = make(map[string][]*schema.Message)
 	historyMutex     sync.Mutex
+	configuredTools  []tool.BaseTool
+	configuredPrompt string
 )
 
-// StartWebChat 启动 Web 聊天服务
 func StartWebChat() {
 	ctx := context.Background()
-
-	// 1. 初始化模型和 Agent
-	err := initAgents(ctx)
-	if err != nil {
-		fmt.Printf("初始化 Agents 失败: %v\n", err)
-		return
-	}
 
 	promptData, err := readPromptConfig()
 	if err != nil {
@@ -79,9 +63,12 @@ func StartWebChat() {
 			Persona: "你是人工智能助手，擅长中文和英文的对话。",
 		}
 	}
-	cfg := promptData
 
-	// ======================== SSE 流式聊天 API ========================
+	if err := initRuntime(ctx, promptData); err != nil {
+		fmt.Printf("初始化运行环境失败: %v\n", err)
+		return
+	}
+
 	http.HandleFunc("/api/chat/stream", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -98,18 +85,13 @@ func StartWebChat() {
 			return
 		}
 
-		modelID := req.Model
-		if modelID == "" {
-			modelID = "kimi-k2" // 默认模型
-		}
-
-		agent, ok := agents[modelID]
-		if !ok {
-			http.Error(w, "不支持的模型", http.StatusBadRequest)
+		modelID := normalizeModelID(req.Model)
+		agent, err := getOrCreateAgent(r.Context(), modelID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		// 设置 SSE 响应头
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -121,24 +103,20 @@ func StartWebChat() {
 			return
 		}
 
-		// 追加用户消息到历史
-		userMsg := schema.UserMessage(req.Message)
 		sid := req.SessionID
 		if sid == "" {
 			sid = "default"
 		}
 
-		historyMutex.Lock()
-		history := sessionHistories[sid]
-		history = append(history, userMsg)
-		sessionHistories[sid] = history
+		userMsg := schema.UserMessage(req.Message)
 
-		// 拷贝历史用于当前请求
+		historyMutex.Lock()
+		history := append(sessionHistories[sid], userMsg)
+		sessionHistories[sid] = history
 		messages := make([]*schema.Message, len(history))
 		copy(messages, history)
 		historyMutex.Unlock()
 
-		// 使用 Agent 的 Stream 方法。注意 React Agent 的 Stream / Generate 接收的是 []*schema.Message
 		streamResult, err := agent.Stream(r.Context(), messages)
 		if err != nil {
 			chunk, _ := json.Marshal(streamChunk{Error: fmt.Sprintf("Agent 出错: %v", err)})
@@ -147,9 +125,8 @@ func StartWebChat() {
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 
-			// 失败时从历史中移除刚刚添加的用户消息
 			historyMutex.Lock()
-			if h, ok := sessionHistories[sid]; ok && len(h) > 0 {
+			if h := sessionHistories[sid]; len(h) > 0 {
 				sessionHistories[sid] = h[:len(h)-1]
 			}
 			historyMutex.Unlock()
@@ -158,52 +135,40 @@ func StartWebChat() {
 
 		var fullContent strings.Builder
 
-		// 逐 chunk 读取并推送
 		for {
 			msg, err := streamResult.Recv()
 			if err != nil {
-				// 流结束
 				break
 			}
-			if msg == nil {
+			if msg == nil || msg.Content == "" {
 				continue
 			}
 
-			content := msg.Content
-			if content == "" {
-				continue
-			}
+			fullContent.WriteString(msg.Content)
 
-			fullContent.WriteString(content)
-
-			chunk, _ := json.Marshal(streamChunk{Content: content})
+			chunk, _ := json.Marshal(streamChunk{Content: msg.Content})
 			fmt.Fprintf(w, "data: %s\n\n", chunk)
 			flusher.Flush()
 		}
 
 		finalReply := fullContent.String()
-
-		// 追加 AI 回复到历史
 		if finalReply != "" {
 			historyMutex.Lock()
 			sessionHistories[sid] = append(sessionHistories[sid], schema.AssistantMessage(finalReply, nil))
 			historyMutex.Unlock()
 		}
 
-		// 匹配图片
-		imageURL := matchImage(cfg, req.Message, finalReply)
+		imageURL := matchImage(promptData, req.Message, finalReply)
 		if imageURL != "" {
 			chunk, _ := json.Marshal(streamChunk{Image: imageURL})
 			fmt.Fprintf(w, "data: %s\n\n", chunk)
 			flusher.Flush()
 		}
 
-		// 发送结束标识
 		fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
 	})
 
-	// ======================== 清空历史 API ========================
 	http.HandleFunc("/api/chat/clear", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -221,21 +186,20 @@ func StartWebChat() {
 		historyMutex.Lock()
 		delete(sessionHistories, req.SessionID)
 		historyMutex.Unlock()
+
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	// 图片静态文件服务
 	http.Handle("/image/", http.StripPrefix("/image/", http.FileServer(http.Dir("image"))))
 
-	// 页面
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(chatHTML))
 	})
 
 	addr := ":8080"
-	fmt.Println("\n🌐 Web 对话服务已启动！(支持多模型 + 上下文记忆)")
+	fmt.Println("\n🌐 Web 对话服务已启动！(支持多模型 + RAG + 上下文记忆)")
 	fmt.Println("   浏览器访问: http://localhost" + addr)
 	fmt.Println("   按 Ctrl+C 停止服务\n")
 
@@ -246,134 +210,185 @@ func StartWebChat() {
 	}
 }
 
-func initAgents(ctx context.Context) error {
-	tools := []tool.BaseTool{
+func initRuntime(ctx context.Context, cfg *promptConfig) error {
+	configuredTools = []tool.BaseTool{
 		&CalculatorTool{},
 		&TimeTool{},
-		&KnowledgeTool{}, // 新增 RAG 工具
+		&KnowledgeTool{},
 	}
+	configuredPrompt = buildSystemPrompt(cfg)
 
-	// 0. 初始化 RAG (优先使用智谱 Key，如果没有则回退 OpenAI Key)
 	glmKey := os.Getenv("ZHIPU_API_KEY")
 	if glmKey == "" {
 		glmKey = os.Getenv("OPENAI_API_KEY")
 	}
+
 	if err := InitRAG(ctx, glmKey); err != nil {
 		fmt.Printf("⚠️  RAG 知识库初始化失败: %v\n", err)
 	} else {
-		fmt.Printf("✅ RAG 知识库初始化成功 (如果 knowledge 目录下有文件)\n")
-	}
-
-	promptData, _ := readPromptConfig()
-	systemPrompt := ""
-	if promptData != nil {
-		systemPrompt = promptData.Persona + "\n在回答问题时，请遵循以下规则：\n\n"
-		for i, r := range promptData.Rules {
-			systemPrompt += fmt.Sprintf("条目%d. 当用户问\"%s\"或类似问题时，回答：%s\n\n", i+1, r.Trigger, r.Answer)
-		}
-
-		if len(promptData.SystemRules) > 0 {
-			systemPrompt += "系统全局规则：\n"
-			for i, sr := range promptData.SystemRules {
-				systemPrompt += fmt.Sprintf("- 规则%d: %s\n", i+1, sr)
-			}
-			systemPrompt += "\n"
-		}
-
-		if promptData.Fallback != "" {
-			systemPrompt += "兜底策略：" + promptData.Fallback
-		}
-	} else {
-		systemPrompt = "你是智能助手"
-	}
-
-	messageModifier := func(ctx context.Context, input []*schema.Message) []*schema.Message {
-		msgs := make([]*schema.Message, 0, len(input)+1)
-		msgs = append(msgs, schema.SystemMessage(systemPrompt))
-		msgs = append(msgs, input...)
-		return msgs
-	}
-
-	// 1. Kimi K2
-	kimiKey := os.Getenv("MOONSHOT_API_KEY")
-	if kimiKey == "" {
-		kimiKey = "sk-5rKOvSmwV015EurXmJaSLSdsnk8tOEFdQkCJkLpfJrBiELIb" // 默认演示 Key
-	}
-	kimiModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
-		APIKey:  kimiKey,
-		BaseURL: "https://api.moonshot.cn/v1",
-		Model:   "moonshot-v1-8k",
-	})
-	if err != nil {
-		return fmt.Errorf("kimi model init failed: %v", err)
-	}
-	kimiAgent, err := react.NewAgent(ctx, &react.AgentConfig{
-		ToolCallingModel: kimiModel,
-		ToolsConfig:      compose.ToolsNodeConfig{Tools: tools},
-		MessageModifier:  messageModifier,
-	})
-	if err != nil {
-		return fmt.Errorf("kimi agent init failed: %v", err)
-	}
-	agents["kimi-k2"] = kimiAgent
-
-	// 2. 智谱 GLM-4  (无条件注册，如果Key为空将在调用时报错而不是提示不支持该模型)
-	glmKey = os.Getenv("ZHIPU_API_KEY")
-	if glmKey == "" {
-		glmKey = os.Getenv("OPENAI_API_KEY") // 兼容旧的环境变量
-	}
-	if glmKey == "" {
-		fmt.Println("⚠️  未设置 ZHIPU_API_KEY 或 OPENAI_API_KEY 环境变量，智谱 GLM 模型将无法调用")
-	}
-	glmModel, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{
-		APIKey:  glmKey,
-		BaseURL: "https://open.bigmodel.cn/api/paas/v4",
-		Model:   "glm-4.1v-thinking-flash",
-	})
-	if err == nil {
-		glmAgent, err := react.NewAgent(ctx, &react.AgentConfig{
-			ToolCallingModel: glmModel,
-			ToolsConfig:      compose.ToolsNodeConfig{Tools: tools},
-			MessageModifier:  messageModifier,
-		})
-		if err == nil {
-			agents["glm-4"] = glmAgent
-		}
+		fmt.Printf("✅ RAG 知识库初始化完成\n")
 	}
 
 	return nil
 }
 
-// readPromptConfig 读取提示词配置
+func buildSystemPrompt(cfg *promptConfig) string {
+	if cfg == nil {
+		return "你是智能助手"
+	}
+
+	var builder strings.Builder
+	builder.WriteString(cfg.Persona)
+	builder.WriteString("\n在回答问题时，请遵循以下规则：\n\n")
+
+	for i, r := range cfg.Rules {
+		builder.WriteString(fmt.Sprintf("条目%d. 当用户问“%s”或类似问题时，回答：%s\n\n", i+1, r.Trigger, r.Answer))
+	}
+
+	if len(cfg.SystemRules) > 0 {
+		builder.WriteString("系统全局规则：\n")
+		for i, sr := range cfg.SystemRules {
+			builder.WriteString(fmt.Sprintf("- 规则%d: %s\n", i+1, sr))
+		}
+		builder.WriteString("\n")
+	}
+
+	if cfg.Fallback != "" {
+		builder.WriteString("兜底策略：")
+		builder.WriteString(cfg.Fallback)
+	}
+
+	return builder.String()
+}
+
+func getOrCreateAgent(ctx context.Context, modelID string) (*react.Agent, error) {
+	modelID = normalizeModelID(modelID)
+
+	agentMutex.Lock()
+	if agent, ok := agentCache[modelID]; ok {
+		agentMutex.Unlock()
+		return agent, nil
+	}
+	agentMutex.Unlock()
+
+	chatModel, err := newChatModel(ctx, modelID)
+	if err != nil {
+		return nil, err
+	}
+
+	agent, err := react.NewAgent(ctx, &react.AgentConfig{
+		ToolCallingModel: chatModel,
+		ToolsConfig:      compose.ToolsNodeConfig{Tools: configuredTools},
+		MessageModifier: func(ctx context.Context, input []*schema.Message) []*schema.Message {
+			msgs := make([]*schema.Message, 0, len(input)+1)
+			msgs = append(msgs, schema.SystemMessage(configuredPrompt))
+			msgs = append(msgs, input...)
+			return msgs
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("创建 Agent 失败: %v", err)
+	}
+
+	agentMutex.Lock()
+	if cached, ok := agentCache[modelID]; ok {
+		agentMutex.Unlock()
+		return cached, nil
+	}
+	agentCache[modelID] = agent
+	agentMutex.Unlock()
+
+	return agent, nil
+}
+
+func newChatModel(ctx context.Context, modelID string) (*openai.ChatModel, error) {
+	modelID = normalizeModelID(modelID)
+
+	switch {
+	case strings.HasPrefix(modelID, "moonshot"):
+		apiKey := os.Getenv("MOONSHOT_API_KEY")
+		if apiKey == "" {
+			return nil, fmt.Errorf("模型 %s 缺少 MOONSHOT_API_KEY", modelID)
+		}
+		return openai.NewChatModel(ctx, &openai.ChatModelConfig{
+			APIKey:  apiKey,
+			BaseURL: "https://api.moonshot.cn/v1",
+			Model:   modelID,
+		})
+
+	case strings.HasPrefix(modelID, "glm"):
+		apiKey := os.Getenv("ZHIPU_API_KEY")
+		if apiKey == "" {
+			apiKey = os.Getenv("OPENAI_API_KEY")
+		}
+		if apiKey == "" {
+			return nil, fmt.Errorf("模型 %s 缺少 ZHIPU_API_KEY", modelID)
+		}
+		return openai.NewChatModel(ctx, &openai.ChatModelConfig{
+			APIKey:  apiKey,
+			BaseURL: "https://open.bigmodel.cn/api/paas/v4",
+			Model:   modelID,
+		})
+
+	case strings.HasPrefix(modelID, "qwen"):
+		apiKey := os.Getenv("ALIYUN_API_KEY")
+		if apiKey == "" {
+			return nil, fmt.Errorf("模型 %s 缺少 ALIYUN_API_KEY", modelID)
+		}
+		return openai.NewChatModel(ctx, &openai.ChatModelConfig{
+			APIKey:  apiKey,
+			BaseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+			Model:   modelID,
+		})
+	}
+
+	return nil, fmt.Errorf("不支持的模型: %s", modelID)
+}
+
+func normalizeModelID(modelID string) string {
+	switch modelID {
+	case "", "kimi-k2":
+		return "moonshot-v1-8k"
+	case "glm-4":
+		return "glm-4.1v-thinking-flash"
+	default:
+		return modelID
+	}
+}
+
 func readPromptConfig() (*promptConfig, error) {
 	data, err := os.ReadFile("prompt_config.json")
 	if err != nil {
 		return nil, err
 	}
+
 	var cfg promptConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
+
 	return &cfg, nil
 }
 
-// matchImage 匹配图片
 func matchImage(cfg *promptConfig, userMsg, reply string) string {
-	msgLower := strings.ToLower(userMsg)
-	for _, r := range cfg.Rules {
-		triggerLower := strings.ToLower(r.Trigger)
-		if r.Image != "" && (strings.Contains(msgLower, triggerLower) || strings.Contains(triggerLower, msgLower)) {
-			return "/image/" + r.Image
+	if cfg != nil {
+		msgLower := strings.ToLower(userMsg)
+		for _, r := range cfg.Rules {
+			triggerLower := strings.ToLower(r.Trigger)
+			if r.Image != "" && (strings.Contains(msgLower, triggerLower) || strings.Contains(triggerLower, msgLower)) {
+				return "/image/" + r.Image
+			}
 		}
 	}
 
-	// 智能兜底
 	replyLower := strings.ToLower(reply)
 	if strings.Contains(replyLower, "赵苏通") {
 		return "/image/su.jpg"
-	} else if strings.Contains(replyLower, "范晨旭") {
+	}
+	if strings.Contains(replyLower, "范晨旭") {
 		return "/image/fan.jpg"
 	}
+
 	return ""
 }
 
@@ -390,7 +405,6 @@ func openBrowser(url string) {
 	cmd.Start()
 }
 
-// 内嵌的聊天页面 HTML
 const chatHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -421,7 +435,8 @@ const chatHTML = `<!DOCTYPE html>
   }
 
   .header .logo {
-    width: 40px; height: 40px;
+    width: 40px;
+    height: 40px;
     background: linear-gradient(135deg, #8b5cf6, #6d28d9);
     border-radius: 12px;
     display: flex;
@@ -437,6 +452,12 @@ const chatHTML = `<!DOCTYPE html>
     background: linear-gradient(135deg, #c4b5fd, #8b5cf6);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
+  }
+
+  .header .subtitle {
+    font-size: 12px;
+    color: #a1a1aa;
+    margin-top: 2px;
   }
 
   .header .controls {
@@ -456,7 +477,7 @@ const chatHTML = `<!DOCTYPE html>
     outline: none;
     cursor: pointer;
   }
-  
+
   .clear-btn {
     background: rgba(239, 68, 68, 0.1);
     color: #fca5a5;
@@ -467,6 +488,7 @@ const chatHTML = `<!DOCTYPE html>
     cursor: pointer;
     transition: all 0.2s;
   }
+
   .clear-btn:hover {
     background: rgba(239, 68, 68, 0.2);
   }
@@ -477,7 +499,7 @@ const chatHTML = `<!DOCTYPE html>
     gap: 8px;
     padding: 12px 24px;
     background: rgba(139, 92, 246, 0.05);
-    border-bottom: 1px solid rgba(255,255,255,0.04);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
     flex-shrink: 0;
   }
 
@@ -501,6 +523,7 @@ const chatHTML = `<!DOCTYPE html>
   }
 
   .messages::-webkit-scrollbar { width: 4px; }
+
   .messages::-webkit-scrollbar-thumb {
     background: rgba(139, 92, 246, 0.3);
     border-radius: 2px;
@@ -522,7 +545,8 @@ const chatHTML = `<!DOCTYPE html>
   .msg.agent { align-self: flex-start; }
 
   .msg .avatar {
-    width: 36px; height: 36px;
+    width: 36px;
+    height: 36px;
     border-radius: 10px;
     display: flex;
     align-items: center;
@@ -557,7 +581,7 @@ const chatHTML = `<!DOCTYPE html>
   .msg.agent .bubble {
     background: #1e1e2e;
     color: #e4e4e7;
-    border: 1px solid rgba(255,255,255,0.06);
+    border: 1px solid rgba(255, 255, 255, 0.06);
     border-bottom-left-radius: 4px;
   }
 
@@ -580,7 +604,6 @@ const chatHTML = `<!DOCTYPE html>
     transform: scale(1.03);
   }
 
-  /* 流式输出光标动画 */
   .streaming-cursor::after {
     content: '▊';
     animation: blink 0.8s infinite;
@@ -600,7 +623,8 @@ const chatHTML = `<!DOCTYPE html>
   }
 
   .typing span {
-    width: 8px; height: 8px;
+    width: 8px;
+    height: 8px;
     background: #8b5cf6;
     border-radius: 50%;
     animation: bounce 1.4s infinite ease-in-out;
@@ -620,7 +644,10 @@ const chatHTML = `<!DOCTYPE html>
     animation: fadeIn 0.5s ease;
   }
 
-  .welcome .icon { font-size: 48px; margin-bottom: 16px; }
+  .welcome .icon {
+    font-size: 48px;
+    margin-bottom: 16px;
+  }
 
   .welcome h2 {
     font-size: 22px;
@@ -697,7 +724,8 @@ const chatHTML = `<!DOCTYPE html>
   .input-box input::placeholder { color: #52525b; }
 
   .input-box button {
-    width: 44px; height: 44px;
+    width: 44px;
+    height: 44px;
     border-radius: 12px;
     border: none;
     background: linear-gradient(135deg, #8b5cf6, #6d28d9);
@@ -737,12 +765,23 @@ const chatHTML = `<!DOCTYPE html>
   <div class="logo">🤖</div>
   <div>
     <h1>Agent 智能对话平台</h1>
-    <div class="subtitle">流式输出 · 上下文记忆</div>
+    <div class="subtitle">流式输出 · 多模型切换 · 上下文记忆</div>
   </div>
   <div class="controls">
     <select id="modelSelect">
-      <option value="kimi-k2">Kimi K2</option>
-      <option value="glm-4">智谱 GLM-4</option>
+      <optgroup label="Moonshot">
+        <option value="moonshot-v1-8k" selected>Kimi 8K</option>
+      </optgroup>
+      <optgroup label="智谱 GLM">
+        <option value="glm-4.1v-thinking-flash">GLM-4.1V-Thinking-Flash</option>
+        <option value="glm-4-flash">GLM-4-Flash</option>
+        <option value="glm-4.7-flash">GLM-4.7-Flash</option>
+      </optgroup>
+      <optgroup label="通义千问">
+        <option value="qwen-turbo">Qwen-Turbo</option>
+        <option value="qwen-plus">Qwen-Plus</option>
+        <option value="qwen-max">Qwen-Max</option>
+      </optgroup>
     </select>
     <button class="clear-btn" onclick="clearHistory()">清空记忆</button>
   </div>
@@ -752,6 +791,7 @@ const chatHTML = `<!DOCTYPE html>
   <span class="cap-tag">💬 智能对话</span>
   <span class="cap-tag">🧮 数学计算</span>
   <span class="cap-tag">🕐 时间查询</span>
+  <span class="cap-tag">📚 RAG 检索</span>
   <span class="cap-tag">⚡ 流式输出</span>
 </div>
 
@@ -759,7 +799,7 @@ const chatHTML = `<!DOCTYPE html>
   <div class="welcome" id="welcome">
     <div class="icon">✨</div>
     <h2>你好，有什么可以帮你的？</h2>
-    <p>我是全能 AI 助手，带有记忆功能。你可以随时切换模型，或者清空对话记忆。</p>
+    <p>支持多模型切换、知识库检索和上下文记忆。</p>
     <div class="suggestions">
       <div class="suggestion" onclick="sendSuggestion(this)">现在几点了？</div>
       <div class="suggestion" onclick="sendSuggestion(this)">帮我算 1024 × 768</div>
@@ -781,17 +821,13 @@ const chatHTML = `<!DOCTYPE html>
 const messagesEl = document.getElementById('messages');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('sendBtn');
-const welcomeEl = document.getElementById('welcome');
-const modelSelect = document.getElementById('modelSelect');
 let isLoading = false;
 
-// Session ID 管理
 let sessionId = sessionStorage.getItem('sessionId');
 if (!sessionId) {
-  sessionId = 'sess_' + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+  sessionId = 'sess_' + Math.random().toString(36).slice(2, 11) + Date.now().toString(36);
   sessionStorage.setItem('sessionId', sessionId);
 }
-console.log("Current Session ID:", sessionId);
 
 inputEl.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && !isLoading) {
@@ -806,21 +842,31 @@ function sendSuggestion(el) {
 }
 
 async function clearHistory() {
-  if (!confirm("确定要清空当前的对话记忆吗？")) return;
-  
+  if (!confirm('确定要清空当前的对话记忆吗？')) return;
+
   try {
-    await fetch('/api/chat/clear', { 
+    await fetch('/api/chat/clear', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: sessionId })
     });
     messagesEl.innerHTML = '';
-    const clone = welcomeEl.cloneNode(true);
-    messagesEl.appendChild(clone);
-    clone.id = "welcome"; // keep the ID so it can be removed again
-    addMessage("记忆已清空 👋", "agent");
+    messagesEl.insertAdjacentHTML('beforeend',
+      '<div class="welcome" id="welcome">' +
+      '<div class="icon">✨</div>' +
+      '<h2>你好，有什么可以帮你的？</h2>' +
+      '<p>支持多模型切换、知识库检索和上下文记忆。</p>' +
+      '<div class="suggestions">' +
+      '<div class="suggestion" onclick="sendSuggestion(this)">现在几点了？</div>' +
+      '<div class="suggestion" onclick="sendSuggestion(this)">帮我算 1024 × 768</div>' +
+      '<div class="suggestion" onclick="sendSuggestion(this)">介绍一下你的大语言模型</div>' +
+      '<div class="suggestion" onclick="sendSuggestion(this)">刚才的问题你还记得吗？</div>' +
+      '</div>' +
+      '</div>'
+    );
+    addMessage('记忆已清空', 'agent');
   } catch (e) {
-    alert("清空失败: " + e.message);
+    alert('清空失败: ' + e.message);
   }
 }
 
@@ -854,7 +900,6 @@ function addMessage(text, role, imageUrl) {
   return bubble;
 }
 
-// 创建空的 agent 消息气泡（用于流式填充）
 function addStreamBubble() {
   const currentWelcome = document.getElementById('welcome');
   if (currentWelcome) currentWelcome.style.display = 'none';
@@ -904,7 +949,7 @@ async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text || isLoading) return;
 
-  const selectedModel = modelSelect.value;
+  const selectedModel = document.getElementById('modelSelect').value;
 
   isLoading = true;
   sendBtn.disabled = true;
@@ -917,8 +962,8 @@ async function sendMessage() {
     const resp = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        message: text, 
+      body: JSON.stringify({
+        message: text,
         model: selectedModel,
         session_id: sessionId
       })
@@ -926,12 +971,11 @@ async function sendMessage() {
 
     if (!resp.ok) {
       removeTyping();
-      // fetch backend text for detail if bad request
       let errDetail = resp.statusText;
       try {
-          errDetail = await resp.text();
+        errDetail = await resp.text();
       } catch (e) {}
-      addMessage('❌ 服务器错误: ' + resp.status + " - " + errDetail, 'error');
+      addMessage('❌ 服务器错误: ' + resp.status + ' - ' + errDetail, 'error');
       isLoading = false;
       sendBtn.disabled = false;
       inputEl.focus();
@@ -940,7 +984,6 @@ async function sendMessage() {
 
     removeTyping();
     const bubble = addStreamBubble();
-
     const reader = resp.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let buffer = '';
@@ -950,16 +993,14 @@ async function sendMessage() {
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-
-      // 按行解析 SSE
       const lines = buffer.split('\n');
-      buffer = lines.pop(); // 保留未完成的行
+      buffer = lines.pop();
 
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed || !trimmed.startsWith('data: ')) continue;
 
-        const data = trimmed.slice(6); // 去掉 "data: "
+        const data = trimmed.slice(6);
         if (data === '[DONE]') {
           bubble.classList.remove('streaming-cursor');
           continue;
@@ -986,14 +1027,11 @@ async function sendMessage() {
             img.onclick = () => window.open(chunk.image, '_blank');
             bubble.appendChild(img);
           }
-        } catch (e) {
-          // 忽略解析错误
-        }
+        } catch (e) {}
       }
     }
 
     bubble.classList.remove('streaming-cursor');
-
   } catch (err) {
     removeTyping();
     addMessage('❌ 网络错误: ' + err.message, 'error');
