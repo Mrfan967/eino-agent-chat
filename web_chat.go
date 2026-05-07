@@ -72,6 +72,13 @@ func StartWebChat() {
 		return
 	}
 
+	// 初始化 PG 会话表（pgvector 连接可用时）
+	if pgDB != nil {
+		if err := EnsureSessionTables(ctx); err != nil {
+			fmt.Printf("⚠️  会话表初始化失败: %v，将仅使用内存历史。\n", err)
+		}
+	}
+
 	promptData, err := readPromptConfig()
 	if err != nil {
 		fmt.Printf("⚠️  读取 prompt_config.json 失败: %v，将使用默认提示\n", err)
@@ -129,6 +136,12 @@ func StartWebChat() {
 		}
 
 		historyMutex.Lock()
+		// 内存缓存未命中时，从 PG 加载历史（服务重启后首次访问）
+		if _, exists := sessionHistories[sid]; !exists {
+			if loaded, loadErr := LoadSessionHistory(r.Context(), sid); loadErr == nil && len(loaded) > 0 {
+				sessionHistories[sid] = loaded
+			}
+		}
 		history := sessionHistories[sid]
 		history = append(history, userMsg)
 		sessionHistories[sid] = history
@@ -137,6 +150,13 @@ func StartWebChat() {
 		messages := make([]*schema.Message, len(history))
 		copy(messages, history)
 		historyMutex.Unlock()
+
+		// 异步保存用户消息到 PG
+		go func() {
+			if err := SaveMessage(context.Background(), sid, "user", req.Message); err != nil {
+				fmt.Printf("⚠️  保存用户消息失败: %v\n", err)
+			}
+		}()
 
 		// 使用 Agent 的 Stream 方法。注意 React Agent 的 Stream / Generate 接收的是 []*schema.Message
 		streamResult, err := agent.Stream(r.Context(), messages)
@@ -188,6 +208,13 @@ func StartWebChat() {
 			historyMutex.Lock()
 			sessionHistories[sid] = append(sessionHistories[sid], schema.AssistantMessage(finalReply, nil))
 			historyMutex.Unlock()
+
+			// 异步保存 AI 回复到 PG
+			go func(reply string) {
+				if err := SaveMessage(context.Background(), sid, "assistant", reply); err != nil {
+					fmt.Printf("⚠️  保存 AI 回复失败: %v\n", err)
+				}
+			}(finalReply)
 		}
 
 		// 匹配图片
@@ -221,8 +248,51 @@ func StartWebChat() {
 		historyMutex.Lock()
 		delete(sessionHistories, req.SessionID)
 		historyMutex.Unlock()
+
+		// 同步删除 PG 中的会话记录
+		go func(sid string) {
+			if err := DeleteSession(context.Background(), sid); err != nil {
+				fmt.Printf("⚠️  删除 PG 会话失败: %v\n", err)
+			}
+		}(req.SessionID)
+
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	// ======================== 加载历史 API ========================
+	http.HandleFunc("/api/chat/history", func(w http.ResponseWriter, r *http.Request) {
+		sid := r.URL.Query().Get("session_id")
+		if sid == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"messages":[]}`))
+			return
+		}
+
+		msgs, err := LoadSessionHistory(r.Context(), sid)
+		if err != nil || len(msgs) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"messages":[]}`))
+			return
+		}
+
+		type historyMsg struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}
+		var result []historyMsg
+		for _, m := range msgs {
+			role := "user"
+			if m.Role == schema.Assistant {
+				role = "assistant"
+			} else if m.Role == schema.System {
+				role = "system"
+			}
+			result = append(result, historyMsg{Role: role, Content: m.Content})
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"messages": result})
 	})
 
 	// 图片静态文件服务
@@ -786,12 +856,29 @@ const modelSelect = document.getElementById('modelSelect');
 let isLoading = false;
 
 // Session ID 管理
-let sessionId = sessionStorage.getItem('sessionId');
+let sessionId = localStorage.getItem('sessionId');
 if (!sessionId) {
   sessionId = 'sess_' + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
-  sessionStorage.setItem('sessionId', sessionId);
+  localStorage.setItem('sessionId', sessionId);
 }
 console.log("Current Session ID:", sessionId);
+
+// 页面加载时恢复历史对话
+(async function loadHistory() {
+  try {
+    const resp = await fetch('/api/chat/history?session_id=' + encodeURIComponent(sessionId));
+    const data = await resp.json();
+    if (data.messages && data.messages.length > 0) {
+      const welcome = document.getElementById('welcome');
+      if (welcome) welcome.remove();
+      data.messages.forEach(m => {
+        addMessage(m.content, m.role === 'user' ? 'user' : 'agent');
+      });
+    }
+  } catch (e) {
+    console.log("加载历史失败:", e);
+  }
+})();
 
 inputEl.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey && !isLoading) {
