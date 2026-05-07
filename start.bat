@@ -32,7 +32,7 @@ if "%MOONSHOT_API_KEY%"=="" if "%ZHIPU_API_KEY%"=="" if "%OPENAI_API_KEY%"=="" i
 )
 
 echo Building binary...
-go build -o "%APP_NAME%" .
+go build -o "%APP_NAME%" ./cmd/server
 if errorlevel 1 (
     echo Error: build failed
     pause
