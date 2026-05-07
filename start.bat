@@ -1,26 +1,46 @@
 @echo off
 chcp 65001 >nul
-:: Agent 智能对话平台快速部署脚本 (Windows)
+setlocal
 
-:: 1. 设置环境变量
-:: 请在这里填入你的 API Key (如果留空，可能在网页端调用模型时会报错)
-set ZHIPU_API_KEY=5f1faa9546f04e1fa2f20a231cc2deaa.83s9Pt9iAbGN6TO7
-set MOONSHOT_API_KEY=sk-5rKOvSmwV015EurXmJaSLSdsnk8tOEFdQkCJkLpfJrBiELIb
+cd /d "%~dp0"
+
+set "APP_NAME=awesomeProject.exe"
+if "%PORT%"=="" set "PORT=8080"
+if "%ZHIPU_API_KEY%"=="" set "ZHIPU_API_KEY=5f1faa9546f04e1fa2f20a231cc2deaa.83s9Pt9iAbGN6TO7"
+if "%MOONSHOT_API_KEY%"=="" set "MOONSHOT_API_KEY=sk-5rKOvSmwV015EurXmJaSLSdsnk8tOEFdQkCJkLpfJrBiELIb"
+if "%ALIYUN_API_KEY%"=="" set "ALIYUN_API_KEY=sk-ODY1LTEyMTkzODMwNjUwLTE3NzM3MTYwMTQ4MTU="
+if "%PGVECTOR_DSN%"=="" set "PGVECTOR_DSN=postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
 
 echo ----------------------------------------
-echo 🚀 开始编译 Agent 智能对话平台...
+echo Starting %APP_NAME% on Windows Server
+echo Project dir: %cd%
+echo Port: %PORT%
 echo ----------------------------------------
 
-:: 2. 编译项目
-go build -o awesomeProject.exe .
-
-:: 3. 检查编译结果并运行
-if %ERRORLEVEL% equ 0 (
-    echo ✅ 编译成功！正在启动服务...
-    echo ----------------------------------------
-    .\awesomeProject.exe
-) else (
-    echo ❌ 编译失败，请检查代码会有语法错误！
+where go >nul 2>nul
+if errorlevel 1 (
+    echo Error: Go is not installed or not in PATH
+    pause
+    exit /b 1
 )
 
-pause
+if "%MOONSHOT_API_KEY%"=="" if "%ZHIPU_API_KEY%"=="" if "%OPENAI_API_KEY%"=="" if "%ALIYUN_API_KEY%"=="" (
+    echo Error: no model API key found
+    echo Set at least one of: MOONSHOT_API_KEY, ZHIPU_API_KEY, OPENAI_API_KEY, ALIYUN_API_KEY
+    pause
+    exit /b 1
+)
+
+echo Building binary...
+go build -o "%APP_NAME%" ./cmd/server
+if errorlevel 1 (
+    echo Error: build failed
+    pause
+    exit /b 1
+)
+
+echo Build complete, starting service...
+echo Visit: http://your-server-ip:%PORT%
+
+set "PORT=%PORT%"
+"%cd%\%APP_NAME%"

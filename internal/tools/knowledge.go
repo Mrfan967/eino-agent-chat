@@ -1,4 +1,4 @@
-package main
+package tools
 
 import (
 	"context"
@@ -8,10 +8,14 @@ import (
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
+
+	"awesomeProject/internal/rag"
 )
 
 // KnowledgeTool 知识库检索工具
-type KnowledgeTool struct{}
+type KnowledgeTool struct {
+	RAG *rag.Service
+}
 
 func (k *KnowledgeTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 	return &schema.ToolInfo{
@@ -28,7 +32,7 @@ func (k *KnowledgeTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 }
 
 func (k *KnowledgeTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
-	if GlobalRAGStore == nil {
+	if k.RAG == nil || k.RAG.IsEmpty() {
 		return "系统未初始化知识库", nil
 	}
 
@@ -42,8 +46,7 @@ func (k *KnowledgeTool) InvokableRun(ctx context.Context, argumentsInJSON string
 		return "请输入有效的查询参数 query", nil
 	}
 
-	// 检索 Top-3 相关文档
-	results, err := GlobalRAGStore.Search(ctx, query, 3)
+	results, err := k.RAG.Search(ctx, query, 3)
 	if err != nil {
 		return "", fmt.Errorf("检索知识库失败: %v", err)
 	}
@@ -52,12 +55,10 @@ func (k *KnowledgeTool) InvokableRun(ctx context.Context, argumentsInJSON string
 		return "在知识库中未找到相关内容", nil
 	}
 
-	// 组合结果
 	var sb strings.Builder
 	sb.WriteString("从知识库中检索到以下相关信息：\n\n")
 	for i, res := range results {
 		sb.WriteString(fmt.Sprintf("---\n片段 %d:\n%s\n", i+1, res))
 	}
-
 	return sb.String(), nil
 }
