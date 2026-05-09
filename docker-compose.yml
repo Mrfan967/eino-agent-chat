@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  # PostgreSQL + pgvector
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: eino-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 应用服务
+  app:
+    build: .
+    container_name: eino-chat
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      # ===== 必填：至少设置一个模型 API Key =====
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-sk-5rKOvSmwV015EurXmJaSLSdsnk8tOEFdQkCJkLpfJrBiELIb}
+      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-5f1faa9546f04e1fa2f20a231cc2deaa.83s9Pt9iAbGN6TO7}
+      # PostgreSQL 连接（容器内部通过服务名 postgres 访问）
+      PGVECTOR_DSN: postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

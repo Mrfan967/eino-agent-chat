@@ -1,0 +1,7 @@
+*.exe
+*.bat
+.git
+.idea
+.vscode
+awesomeProject
+web_chat.go
