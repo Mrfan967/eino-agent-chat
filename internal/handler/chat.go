@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cloudwego/eino/schema"
 
@@ -95,6 +97,8 @@ func (h *ChatHandler) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	start := time.Now()
+
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -110,6 +114,8 @@ func (h *ChatHandler) handleStream(w http.ResponseWriter, r *http.Request) {
 	if sid == "" {
 		sid = "default"
 	}
+
+	log.Printf("[INFO] 收到消息 session=%s model=%s msg=%.60s", sid, modelID, req.Message)
 
 	userMsg := schema.UserMessage(req.Message)
 
@@ -128,12 +134,13 @@ func (h *ChatHandler) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		if err := store.SaveMessage(context.Background(), sid, "user", req.Message); err != nil {
-			fmt.Printf("⚠️  保存用户消息失败: %v\n", err)
+			log.Printf("[WARN] 保存用户消息失败 session=%s: %v", sid, err)
 		}
 	}()
 
 	streamResult, err := ag.Stream(r.Context(), messages)
 	if err != nil {
+		log.Printf("[ERROR] Agent 出错 session=%s model=%s: %v", sid, modelID, err)
 		chunk, _ := json.Marshal(streamChunk{Error: fmt.Sprintf("Agent 出错: %v", err)})
 		fmt.Fprintf(w, "data: %s\n\n", chunk)
 		flusher.Flush()
@@ -169,9 +176,10 @@ func (h *ChatHandler) handleStream(w http.ResponseWriter, r *http.Request) {
 		h.sessionHistories[sid] = append(h.sessionHistories[sid], schema.AssistantMessage(finalReply, nil))
 		h.mu.Unlock()
 
+		log.Printf("[INFO] 回复完成 session=%s model=%s 长度=%d 耗时=%v", sid, modelID, len(finalReply), time.Since(start))
 		go func(reply string) {
 			if err := store.SaveMessage(context.Background(), sid, "assistant", reply); err != nil {
-				fmt.Printf("⚠️  保存 AI 回复失败: %v\n", err)
+				log.Printf("[WARN] 保存 AI 回复失败 session=%s: %v", sid, err)
 			}
 		}(finalReply)
 	}
@@ -206,9 +214,10 @@ func (h *ChatHandler) handleClear(w http.ResponseWriter, r *http.Request) {
 	delete(h.sessionHistories, req.SessionID)
 	h.mu.Unlock()
 
+	log.Printf("[INFO] 清空会话 session=%s", req.SessionID)
 	go func(sid string) {
 		if err := store.DeleteSession(context.Background(), sid); err != nil {
-			fmt.Printf("⚠️  删除 PG 会话失败: %v\n", err)
+			log.Printf("[WARN] 删除 PG 会话失败 session=%s: %v", sid, err)
 		}
 	}(req.SessionID)
 
