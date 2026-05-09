@@ -389,9 +389,34 @@ if (!sessionId) {
   sessionId = 'sess_' + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
   localStorage.setItem('sessionId', sessionId);
 }
-console.log("Current Session ID:", sessionId);
 
-// 页面加载时恢复历史对话
+// ==================== WebSocket 管理 ====================
+let ws = null;
+let currentMsgHandler = null;
+
+function connectWS() {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${protocol}//${location.host}/ws/chat`);
+
+  ws.onopen = () => console.log('[WS] 已连接');
+
+  ws.onclose = () => {
+    console.log('[WS] 断开，3秒后重连...');
+    setTimeout(connectWS, 3000);
+  };
+
+  ws.onerror = (e) => console.error('[WS] 错误:', e);
+
+  ws.onmessage = (event) => {
+    if (currentMsgHandler) {
+      try { currentMsgHandler(JSON.parse(event.data)); } catch (e) {}
+    }
+  };
+}
+
+connectWS();
+
+// ==================== 历史记录（HTTP） ====================
 (async function loadHistory() {
   try {
     const resp = await fetch('/api/chat/history?session_id=' + encodeURIComponent(sessionId));
@@ -438,6 +463,7 @@ async function clearHistory() {
   }
 }
 
+// ==================== UI 工具函数 ====================
 function addMessage(text, role, imageUrl) {
   const currentWelcome = document.getElementById('welcome');
   if (currentWelcome) currentWelcome.style.display = 'none';
@@ -513,9 +539,15 @@ function removeTyping() {
   if (el) el.remove();
 }
 
+// ==================== 发送消息（WebSocket） ====================
 async function sendMessage() {
   const text = inputEl.value.trim();
   if (!text || isLoading) return;
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    addMessage('❌ 连接中，请稍后重试', 'error');
+    return;
+  }
 
   const selectedModel = modelSelect.value;
   isLoading = true;
@@ -525,76 +557,35 @@ async function sendMessage() {
   addMessage(text, 'user');
   showTyping();
 
-  try {
-    const resp = await fetch('/api/chat/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, model: selectedModel, session_id: sessionId })
-    });
+  ws.send(JSON.stringify({ message: text, model: selectedModel, session_id: sessionId }));
 
-    if (!resp.ok) {
-      removeTyping();
-      let errDetail = resp.statusText;
-      try { errDetail = await resp.text(); } catch (e) {}
-      addMessage('❌ 服务器错误: ' + resp.status + " - " + errDetail, 'error');
-      isLoading = false;
-      sendBtn.disabled = false;
-      inputEl.focus();
-      return;
-    }
+  removeTyping();
+  const bubble = addStreamBubble();
 
-    removeTyping();
-    const bubble = addStreamBubble();
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder('utf-8');
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-
-        const data = trimmed.slice(6);
-        if (data === '[DONE]') {
-          bubble.classList.remove('streaming-cursor');
-          continue;
-        }
-
-        try {
-          const chunk = JSON.parse(data);
-          if (chunk.error) {
-            bubble.textContent = '❌ ' + chunk.error;
-            bubble.classList.remove('streaming-cursor');
-            continue;
-          }
-          if (chunk.content) {
-            bubble.textContent += chunk.content;
-            messagesEl.scrollTop = messagesEl.scrollHeight;
-          }
-          if (chunk.image) {
-            const img = document.createElement('img');
-            img.src = chunk.image;
-            img.className = 'chat-img';
-            img.onclick = () => window.open(chunk.image, '_blank');
-            bubble.appendChild(img);
-          }
-        } catch (e) {}
+  await new Promise((resolve) => {
+    currentMsgHandler = (chunk) => {
+      if (chunk.error) {
+        bubble.textContent = '❌ ' + chunk.error;
+        bubble.classList.remove('streaming-cursor');
       }
-    }
-
-    bubble.classList.remove('streaming-cursor');
-
-  } catch (err) {
-    removeTyping();
-    addMessage('❌ 网络错误: ' + err.message, 'error');
-  }
+      if (chunk.content) {
+        bubble.textContent += chunk.content;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+      if (chunk.image) {
+        const img = document.createElement('img');
+        img.src = chunk.image;
+        img.className = 'chat-img';
+        img.onclick = () => window.open(chunk.image, '_blank');
+        bubble.appendChild(img);
+      }
+      if (chunk.done) {
+        bubble.classList.remove('streaming-cursor');
+        currentMsgHandler = null;
+        resolve();
+      }
+    };
+  });
 
   isLoading = false;
   sendBtn.disabled = false;

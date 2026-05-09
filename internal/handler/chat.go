@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+
 	"net/http"
 	"os"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/schema"
+	"github.com/gorilla/websocket"
 
 	"awesomeProject/internal/agent"
 	"awesomeProject/internal/config"
@@ -19,6 +21,21 @@ import (
 )
 
 var chatHTML []byte
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+type wsWriter struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (w *wsWriter) writeJSON(v interface{}) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.conn.WriteJSON(v)
+}
 
 func init() {
 	data, err := os.ReadFile("web/chat.html")
@@ -55,144 +72,14 @@ func NewChatHandler(registry *agent.Registry, cfg *config.PromptConfig) *ChatHan
 
 // RegisterRoutes 注册所有 HTTP 路由
 func (h *ChatHandler) RegisterRoutes() {
-	http.HandleFunc("/api/chat/stream", h.handleStream)
 	http.HandleFunc("/api/chat/clear", h.handleClear)
 	http.HandleFunc("/api/chat/history", h.handleHistory)
+	http.HandleFunc("/ws/chat", h.handleWebSocket)
 	http.Handle("/image/", http.StripPrefix("/image/", http.FileServer(http.Dir("image"))))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(chatHTML)
 	})
-}
-
-// handleStream 处理 SSE 流式聊天
-func (h *ChatHandler) handleStream(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Message   string `json:"message"`
-		Model     string `json:"model"`
-		SessionID string `json:"session_id"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "请求格式错误", http.StatusBadRequest)
-		return
-	}
-	if req.Message == "" {
-		http.Error(w, "消息不能为空", http.StatusBadRequest)
-		return
-	}
-
-	modelID := req.Model
-	if modelID == "" {
-		modelID = "kimi-k2"
-	}
-
-	ag, ok := h.registry.Get(modelID)
-	if !ok {
-		http.Error(w, "不支持的模型", http.StatusBadRequest)
-		return
-	}
-
-	start := time.Now()
-
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "不支持流式输出", http.StatusInternalServerError)
-		return
-	}
-
-	sid := req.SessionID
-	if sid == "" {
-		sid = "default"
-	}
-
-	log.Printf("[INFO] 收到消息 session=%s model=%s msg=%.60s", sid, modelID, req.Message)
-
-	userMsg := schema.UserMessage(req.Message)
-
-	h.mu.Lock()
-	if _, exists := h.sessionHistories[sid]; !exists {
-		if loaded, loadErr := store.LoadSessionHistory(r.Context(), sid); loadErr == nil && len(loaded) > 0 {
-			h.sessionHistories[sid] = loaded
-		}
-	}
-	history := h.sessionHistories[sid]
-	history = append(history, userMsg)
-	h.sessionHistories[sid] = history
-	messages := make([]*schema.Message, len(history))
-	copy(messages, history)
-	h.mu.Unlock()
-
-	go func() {
-		if err := store.SaveMessage(context.Background(), sid, "user", req.Message); err != nil {
-			log.Printf("[WARN] 保存用户消息失败 session=%s: %v", sid, err)
-		}
-	}()
-
-	streamResult, err := ag.Stream(r.Context(), messages)
-	if err != nil {
-		log.Printf("[ERROR] Agent 出错 session=%s model=%s: %v", sid, modelID, err)
-		chunk, _ := json.Marshal(streamChunk{Error: fmt.Sprintf("Agent 出错: %v", err)})
-		fmt.Fprintf(w, "data: %s\n\n", chunk)
-		flusher.Flush()
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
-
-		h.mu.Lock()
-		if hist, ok := h.sessionHistories[sid]; ok && len(hist) > 0 {
-			h.sessionHistories[sid] = hist[:len(hist)-1]
-		}
-		h.mu.Unlock()
-		return
-	}
-
-	var fullContent strings.Builder
-	for {
-		msg, err := streamResult.Recv()
-		if err != nil {
-			break
-		}
-		if msg == nil || msg.Content == "" {
-			continue
-		}
-		fullContent.WriteString(msg.Content)
-		chunk, _ := json.Marshal(streamChunk{Content: msg.Content})
-		fmt.Fprintf(w, "data: %s\n\n", chunk)
-		flusher.Flush()
-	}
-
-	finalReply := fullContent.String()
-	if finalReply != "" {
-		h.mu.Lock()
-		h.sessionHistories[sid] = append(h.sessionHistories[sid], schema.AssistantMessage(finalReply, nil))
-		h.mu.Unlock()
-
-		log.Printf("[INFO] 回复完成 session=%s model=%s 长度=%d 耗时=%v", sid, modelID, len(finalReply), time.Since(start))
-		go func(reply string) {
-			if err := store.SaveMessage(context.Background(), sid, "assistant", reply); err != nil {
-				log.Printf("[WARN] 保存 AI 回复失败 session=%s: %v", sid, err)
-			}
-		}(finalReply)
-	}
-
-	imageURL := matchImage(h.cfg, req.Message, finalReply)
-	if imageURL != "" {
-		chunk, _ := json.Marshal(streamChunk{Image: imageURL})
-		fmt.Fprintf(w, "data: %s\n\n", chunk)
-		flusher.Flush()
-	}
-
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
 }
 
 // handleClear 清空会话历史
@@ -258,6 +145,126 @@ func (h *ChatHandler) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"messages": result})
+}
+
+// handleWebSocket 处理 WebSocket 流式聊天
+func (h *ChatHandler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[ERROR] WebSocket 升级失败: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	wsw := &wsWriter{conn: conn}
+
+	for {
+		_, msgBytes, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				log.Printf("[WARN] WebSocket 异常断开: %v", err)
+			}
+			break
+		}
+
+		var req struct {
+			Message   string `json:"message"`
+			Model     string `json:"model"`
+			SessionID string `json:"session_id"`
+		}
+		if err := json.Unmarshal(msgBytes, &req); err != nil {
+			wsw.writeJSON(streamChunk{Error: "请求格式错误"})
+			continue
+		}
+		if req.Message == "" {
+			wsw.writeJSON(streamChunk{Error: "消息不能为空"})
+			continue
+		}
+
+		modelID := req.Model
+		if modelID == "" {
+			modelID = "kimi-k2"
+		}
+		sid := req.SessionID
+		if sid == "" {
+			sid = "default"
+		}
+
+		ag, ok := h.registry.Get(modelID)
+		if !ok {
+			wsw.writeJSON(streamChunk{Error: "不支持的模型"})
+			continue
+		}
+
+		log.Printf("[INFO] WS 收到消息 session=%s model=%s msg=%.60s", sid, modelID, req.Message)
+		start := time.Now()
+
+		userMsg := schema.UserMessage(req.Message)
+
+		h.mu.Lock()
+		if _, exists := h.sessionHistories[sid]; !exists {
+			if loaded, loadErr := store.LoadSessionHistory(r.Context(), sid); loadErr == nil && len(loaded) > 0 {
+				h.sessionHistories[sid] = loaded
+			}
+		}
+		history := h.sessionHistories[sid]
+		history = append(history, userMsg)
+		h.sessionHistories[sid] = history
+		messages := make([]*schema.Message, len(history))
+		copy(messages, history)
+		h.mu.Unlock()
+
+		go func() {
+			if err := store.SaveMessage(context.Background(), sid, "user", req.Message); err != nil {
+				log.Printf("[WARN] 保存用户消息失败 session=%s: %v", sid, err)
+			}
+		}()
+
+		streamResult, err := ag.Stream(r.Context(), messages)
+		if err != nil {
+			log.Printf("[ERROR] Agent 出错 session=%s model=%s: %v", sid, modelID, err)
+			wsw.writeJSON(streamChunk{Error: fmt.Sprintf("Agent 出错: %v", err)})
+			wsw.writeJSON(streamChunk{Done: true})
+			h.mu.Lock()
+			if hist, ok2 := h.sessionHistories[sid]; ok2 && len(hist) > 0 {
+				h.sessionHistories[sid] = hist[:len(hist)-1]
+			}
+			h.mu.Unlock()
+			continue
+		}
+
+		var fullContent strings.Builder
+		for {
+			msg, err := streamResult.Recv()
+			if err != nil {
+				break
+			}
+			if msg == nil || msg.Content == "" {
+				continue
+			}
+			fullContent.WriteString(msg.Content)
+			wsw.writeJSON(streamChunk{Content: msg.Content})
+		}
+
+		finalReply := fullContent.String()
+		if finalReply != "" {
+			h.mu.Lock()
+			h.sessionHistories[sid] = append(h.sessionHistories[sid], schema.AssistantMessage(finalReply, nil))
+			h.mu.Unlock()
+			log.Printf("[INFO] WS 回复完成 session=%s model=%s 长度=%d 耗时=%v", sid, modelID, len(finalReply), time.Since(start))
+			go func(reply string) {
+				if err := store.SaveMessage(context.Background(), sid, "assistant", reply); err != nil {
+					log.Printf("[WARN] 保存 AI 回复失败 session=%s: %v", sid, err)
+				}
+			}(finalReply)
+		}
+
+		imageURL := matchImage(h.cfg, req.Message, finalReply)
+		if imageURL != "" {
+			wsw.writeJSON(streamChunk{Image: imageURL})
+		}
+		wsw.writeJSON(streamChunk{Done: true})
+	}
 }
 
 // matchImage 根据消息内容匹配图片
