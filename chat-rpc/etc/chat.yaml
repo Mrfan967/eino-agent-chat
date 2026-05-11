@@ -1,0 +1,22 @@
+Name: chat.rpc
+ListenOn: 0.0.0.0:8083
+Cache:
+  Host: localhost:6379
+  Type: node
+Models:
+  KimiK2:
+    APIKey: "sk-5rKOvSmwV015EurXmJaSLSdsnk8tOEFdQkCJkLpfJrBiELIb"
+    BaseURL: "https://api.moonshot.cn/v1"
+    Model: "moonshot-v1-8k"
+  GLM4:
+    APIKey: "5f1faa9546f04e1fa2f20a231cc2deaa.83s9Pt9iAbGN6TO7"
+    BaseURL: "https://open.bigmodel.cn/api/paas/v4"
+    Model: "glm-4.1v-thinking-flash"
+PromptConfig:
+  Path: "../prompt_config.json"
+RAGRpc:
+  Endpoints:
+    - 127.0.0.1:8082
+SessionRpc:
+  Endpoints:
+    - 127.0.0.1:8081

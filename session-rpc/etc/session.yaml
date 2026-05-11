@@ -1,0 +1,4 @@
+Name: session.rpc
+ListenOn: 0.0.0.0:8081
+Database:
+  DSN: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable

@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package chat;
+option go_package = "awesomeProject/chat-rpc/chat";
+
+service ChatService {
+    // 流式聊天
+    rpc Stream(stream ChatReq) returns (stream ChatChunk);
+    // 非流式聊天
+    rpc Chat(ChatReq) returns (ChatResp);
+}
+
+enum Role {
+    UNKNOWN = 0;
+    USER = 1;
+    ASSISTANT = 2;
+    SYSTEM = 3;
+}
+
+message ChatMessage {
+    Role role = 1;
+    string content = 2;
+}
+
+message ChatReq {
+    string session_id = 1;
+    string model = 2;        // kimi-k2 | glm-4
+    string message = 3;
+    repeated ChatMessage history = 4;  // 可选：直接传历史
+}
+
+message ChatChunk {
+    string content = 1;
+    bool done = 2;
+    string error = 3;
+    string image = 4;        // 可选的图片链接
+}
+
+message ChatResp {
+    string session_id = 1;
+    string content = 2;
+    string model = 3;
+    string image = 4;
+    int32 token_count = 5;
+}

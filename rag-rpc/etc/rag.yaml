@@ -1,0 +1,10 @@
+Name: rag.rpc
+ListenOn: 0.0.0.0:8082
+Embedding:
+  APIKey: ${ZHIPU_API_KEY}
+  BaseURL: "https://open.bigmodel.cn/api/paas/v4"
+  Model: "embedding-3"
+Knowledge:
+  Path: "../knowledge"
+Database:
+  DSN: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable

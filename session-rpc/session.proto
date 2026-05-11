@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package session;
+option go_package = "awesomeProject/session-rpc/session";
+
+service SessionService {
+    // 加载会话历史
+    rpc Load(LoadReq) returns (LoadResp);
+    // 保存单条消息
+    rpc Save(SaveReq) returns (SaveResp);
+    // 删除整个会话
+    rpc Delete(DeleteReq) returns (DeleteResp);
+}
+
+message Message {
+    string id = 1;
+    string role = 2;      // user | assistant | system
+    string content = 3;
+    string created_at = 4;
+}
+
+message LoadReq {
+    string session_id = 1;
+}
+
+message LoadResp {
+    string session_id = 1;
+    repeated Message messages = 2;
+}
+
+message SaveReq {
+    string session_id = 1;
+    string role = 2;
+    string content = 3;
+}
+
+message SaveResp {
+    string id = 1;
+    string session_id = 2;
+}
+
+message DeleteReq {
+    string session_id = 1;
+}
+
+message DeleteResp {
+    bool success = 1;
+}

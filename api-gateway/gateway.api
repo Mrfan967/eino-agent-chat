@@ -1,0 +1,28 @@
+syntax = "v1"
+
+type ChatReq {
+	Message   string `json:"message"`
+	Model     string `json:"model"`
+	SessionID string `json:"session_id"`
+}
+
+type ChatChunk {
+	Content string `json:"content,omitempty"`
+	Done    bool   `json:"done,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Image   string `json:"image,omitempty"`
+}
+
+service gateway-api {
+	@handler ChatStreamHandler
+	post /api/chat/stream (ChatReq) returns (ChatChunk)
+	
+	@handler ChatClearHandler
+	post /api/chat/clear
+	
+	@handler ChatHistoryHandler
+	get /api/chat/history
+	
+	@handler WebSocketHandler
+	handler /ws/chat
+}

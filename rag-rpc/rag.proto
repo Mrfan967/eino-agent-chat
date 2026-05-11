@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package rag;
+option go_package = "awesomeProject/rag-rpc/rag";
+
+service RagService {
+    // 混合检索（向量+BM25）
+    rpc Search(SearchReq) returns (SearchResp);
+    // 仅向量检索
+    rpc VectorSearch(VectorSearchReq) returns (SearchResp);
+    // 仅BM25检索
+    rpc BM25Search(BM25SearchReq) returns (SearchResp);
+}
+
+message SearchReq {
+    string query = 1;
+    int32 top_k = 2;    // 默认返回数量
+}
+
+message SearchResp {
+    repeated string chunks = 1;
+    float search_time_ms = 2;
+}
+
+message VectorSearchReq {
+    string query = 1;
+    int32 top_k = 2;
+}
+
+message BM25SearchReq {
+    string query = 1;
+    int32 top_k = 2;
+}
